@@ -44,6 +44,7 @@ import { errorResponse, ErrorCode } from "@/app/lib/errors/server";
 import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { validateCreateStreamBody } from "@/app/lib/stream-validation";
 import { checkTokenAllowed, normaliseToken } from "@/app/lib/token-allowlist";
+import { tryAuthenticateRequest } from "@/app/lib/auth";
 
 const MAX_ROWS = 500;
 
@@ -278,6 +279,9 @@ export async function POST(request: Request) {
   const results: RowResult[] = [];
   let valid = 0;
   let failed = 0;
+  const authenticatedActor = tryAuthenticateRequest(request);
+  const senderAddress = authenticatedActor?.walletAddress ?? null;
+  const ownership: "individual" | "unclaimed" = authenticatedActor ? "individual" : "unclaimed";
 
   for (let i = 0; i < rows.length; i++) {
     const row = normaliseRow(rows[i]);
@@ -303,44 +307,23 @@ export async function POST(request: Request) {
         normalisedToken = "XLM";
       }
 
-      let createdStream = null;
-      const MAX_ID_ATTEMPTS = 3;
+      const newStream = {
+        createdAt: now,
+        id,
+        nextAction: "start" as const,
+        rate: row.rate,
+        recipient: row.recipient,
+        schedule: row.schedule,
+        status: "draft" as const,
+        updatedAt: now,
+        token: normalisedToken,
+        memo: row.memo || undefined,
+        senderAddress,
+        ownership,
+      };
 
-      for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
-        const id = newStreamId();
-        const candidateStream = {
-          createdAt: now,
-          id,
-          nextAction: "start" as const,
-          rate: row.rate,
-          recipient: row.recipient,
-          schedule: row.schedule,
-          status: "draft" as const,
-          updatedAt: now,
-          token: normalisedToken,
-          memo: row.memo || undefined,
-        };
-
-        if (streamRepository.streams.insert(id, candidateStream)) {
-          createdStream = candidateStream;
-          break;
-        }
-      }
-
-      if (!createdStream) {
-        return NextResponse.json(
-          {
-            error: {
-              code: "ID_GENERATION_FAILED",
-              message: "Failed to generate unique stream identifier",
-              request_id: getCorrelationContext()?.request_id,
-            },
-          },
-          { status: 500 },
-        );
-      }
-
-      results.push({ row: i + 1, status: "imported", streamId: createdStream.id });
+      streamRepository.streams.set(id, newStream);
+      results.push({ row: i + 1, status: "imported", streamId: id });
     }
   }
 

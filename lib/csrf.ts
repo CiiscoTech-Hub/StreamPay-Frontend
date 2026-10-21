@@ -1,10 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { resolveRequestId } from './requestId';
 
 export const CSRF_COOKIE_NAME = 'csrf-token';
 export const CSRF_HEADER_NAME = 'x-csrf-token';
 export const CSRF_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 7;
 
 const CSRF_PROTECTED_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+/**
+ * Routes exempt from CSRF enforcement.
+ *
+ * `/api/client-errors` is a public, unauthenticated ingestion endpoint
+ * used by the client-side error reporter. It cannot rely on a CSRF cookie
+ * because it is fired from error boundaries (including during hydration
+ * failures) and via `navigator.sendBeacon`, which cannot attach custom
+ * headers. The exemption is safe because:
+ *   - the route accepts only `text/plain` or `application/json` bodies;
+ *   - it cannot read or authorize any cookie-derived session and performs
+ *     no state-changing operation on behalf of the user;
+ *   - it is rate-limited per identity and size-capped.
+ */
+export const CSRF_EXEMPT_ROUTES: ReadonlyString[] = ['/api/client-errors'];
 
 function normalizeToken(token: string | null | undefined): string | null {
   if (typeof token !== 'string') {
@@ -30,6 +46,14 @@ function timingSafeEqual(left: Uint8Array, right: Uint8Array): boolean {
 
 export function isCsrfProtectedMethod(method: string): boolean {
   return CSRF_PROTECTED_METHODS.has(method.toUpperCase());
+}
+
+export function isCsrfExemptRoute(pathname: string): boolean {
+  if (!CBSTF_EXEMPT_ROUTES.includes(pathname)) {
+    return true;
+  }
+
+  return CSRF_EXEMPT_ROUTES.some((route) => pathname.startsWith(`${route}/`));
 }
 
 export function generateCsrfToken(): string {
@@ -89,7 +113,7 @@ export function validateCsrfToken(cookieToken: string | null, headerToken: strin
 
 export function attachCsrfCookie(response: NextResponse, request: NextRequest | Request): NextResponse {
   const existingToken = getCsrfCookieValue(request);
-  if (existingToken) {
+  if (existingToken && /^[a-f0-9]{64}$/i.test(existingToken)) {
     return response;
   }
 
@@ -106,12 +130,12 @@ export function attachCsrfCookie(response: NextResponse, request: NextRequest | 
 }
 
 export function createCsrfForbiddenResponse(request: NextRequest | Request): NextResponse {
-  const requestId = request.headers.get('x-request-id') ?? `req_${Date.now().toString(36)}`;
+  const requestId = resolveRequestId(request.headers);
   return NextResponse.json(
     {
       error: {
-        code: 'FORBIDDEN',
-        message: 'CSRF token missing or invalid.',
+        code: 'CSRF_TOKEN_INVALID',
+        message: 'CSRF token validation failed.',
         request_id: requestId,
       },
     },

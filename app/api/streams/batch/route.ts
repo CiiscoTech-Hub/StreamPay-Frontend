@@ -15,6 +15,7 @@ import { recordRequest, recordThrottle } from "@/app/lib/rate-limit-metrics";
 import { checkTokenAllowed, checkTokenAllowedForOrg, normaliseToken } from "@/app/lib/token-allowlist";
 import { validateCreateStreamBody } from "@/app/lib/stream-validation";
 import { orgDb } from "@/app/lib/org-db";
+import { tryAuthenticateRequest } from "@/app/lib/auth";
 
 const MAX_BATCH_SIZE = 20;
 
@@ -248,45 +249,37 @@ export async function POST(request: NextRequest) {
 
   const now = new Date().toISOString();
   const createdStreams = [];
+  const authenticatedActor = tryAuthenticateRequest(request);
+  const senderAddress = authenticatedActor?.walletAddress ?? null;
 
   for (const input of validItems) {
-    let createdStream = null;
-    const MAX_ID_ATTEMPTS = 3;
+    const id = `stream-${crypto.randomUUID().slice(0, 8)}`;
+    const ownership: "individual" | "org" | "unclaimed" = input.orgId
+      ? "org"
+      : authenticatedActor
+        ? "individual"
+        : "unclaimed";
 
-    for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
-      const id = newStreamId();
-      const candidateStream = {
-        createdAt: now,
-        id,
-        nextAction: "start" as const,
-        rate: input.rate,
-        recipient: input.recipient,
-        schedule: input.schedule,
-        status: "draft" as const,
-        updatedAt: now,
-        token: input.token,
-      };
-
-      if (streamRepository.streams.insert(id, candidateStream)) {
-        createdStream = candidateStream;
-        break;
-      }
+    if (input.orgId) {
+      orgDb.streamOwnership.set(id, input.orgId);
     }
 
-    if (!createdStream) {
-      return NextResponse.json(
-        {
-          error: {
-            code: "ID_GENERATION_FAILED",
-            message: "Failed to generate unique stream identifier",
-            request_id: getCorrelationContext()?.request_id,
-          },
-        },
-        { status: 500 },
-      );
-    }
+    const newStream = {
+      createdAt: now,
+      id,
+      nextAction: "start" as const,
+      rate: input.rate,
+      recipient: input.recipient,
+      schedule: input.schedule,
+      status: "draft" as const,
+      updatedAt: now,
+      token: input.token,
+      senderAddress,
+      ownership,
+    };
 
-    createdStreams.push(createdStream);
+    streamRepository.streams.set(id, newStream);
+    createdStreams.push(newStream);
   }
 
   const payload = { data: createdStreams, links: { self: "/api/v1/streams/batch" } };

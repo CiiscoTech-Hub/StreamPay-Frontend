@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import type { ActivityEvent, ExportJob, Stream, User } from "@/app/types/openapi";
 import type { ActivityTimelineStore } from "@/app/lib/repositories/activity-timeline";
+import type { StreamHistoryStore } from "@/app/lib/repositories/stream-history";
 import { createInMemoryPersistenceStore } from "@/app/lib/repositories/in-memory";
 import {
   createPostgresPersistenceStore,
@@ -64,6 +65,7 @@ export interface PersistenceStore {
   readonly exportRepository: ExportRepository;
   readonly idempotencyStore: IdempotencyStore;
   readonly kind: "memory" | "postgres";
+  readonly streamHistory: StreamHistoryStore;
   readonly streamRepository: StreamRepository;
 }
 
@@ -151,6 +153,9 @@ export const db = {
   },
   get activityTimeline() {
     return getStore().activityTimeline;
+  },
+  get streamHistory() {
+    return getStore().streamHistory;
   },
   get exportAudit() {
     return getStore().exportRepository.audit;
@@ -312,6 +317,7 @@ export function resetDb(
   const store = getStore();
   if (store.kind === "memory") {
     store.activityTimeline.reset();
+    store.streamHistory.reset();
     store.streamRepository.reset();
     store.idempotencyStore.reset();
     store.exportRepository.reset();
