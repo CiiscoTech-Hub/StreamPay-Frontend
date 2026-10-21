@@ -7,7 +7,9 @@ import {
   getStore,
   idempotencyToken,
   setIdempotency,
+  withLock,
 } from "@/app/lib/db";
+import { newStreamId } from "@/app/lib/stream-id";
 import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { streamsRateLimit } from "@/src/middleware/rateLimit";
 import { checkTokenAllowed, normaliseToken } from "@/app/lib/token-allowlist";
@@ -138,7 +140,6 @@ export async function POST(request: Request) {
     return rateLimitResult.response;
   }
 
-  const url = getRequestUrl(request, "/api/streams");
   const idempotencyKey = getHeader(request, "Idempotency-Key");
   const token = idempotencyKey ? idempotencyToken("streams.create", idempotencyKey) : null;
 
@@ -151,83 +152,105 @@ export async function POST(request: Request) {
 
   const fingerprint = computeFingerprint("POST", "/api/streams", body);
 
-  if (token) {
-    const cached = checkIdempotency(idempotencyStore, token, fingerprint);
-    if (cached) {
-      if (!cached.ok) {
-        return NextResponse.json(
-          { error: { code: "IDEMPOTENCY_CONFLICT", message: "Idempotency key has been used with a different request." } },
-          { status: 409 },
-        );
+  const executeCreate = async () => {
+    if (token) {
+      const cached = checkIdempotency(idempotencyStore, token, fingerprint);
+      if (cached) {
+        if (!cached.ok) {
+          return NextResponse.json(
+            { error: { code: "IDEMPOTENCY_CONFLICT", message: "Idempotency key has been used with a different request." } },
+            { status: 409 },
+          );
+        }
+        return NextResponse.json(cached.body, { status: cached.status });
       }
-      return NextResponse.json(cached.body, { status: cached.status });
     }
-  }
 
-  // ── Schema validation (shared) ────────────────────────────────────────
-  const validationErrors = validateCreateStreamBody(body);
-  if (validationErrors.length > 0) {
-    logger.warn("Stream creation validation failed", {
-      errors: validationErrors,
-    });
-    return NextResponse.json(
-      {
-        error: {
-          code: "VALIDATION_ERROR",
-          message: "One or more fields are invalid.",
-          details: validationErrors,
-          request_id: getCorrelationContext()?.request_id,
+    // ── Schema validation (shared) ────────────────────────────────────────
+    const validationErrors = validateCreateStreamBody(body);
+    if (validationErrors.length > 0) {
+      logger.warn("Stream creation validation failed", {
+        errors: validationErrors,
+      });
+      return NextResponse.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: "One or more fields are invalid.",
+            details: validationErrors,
+            request_id: getCorrelationContext()?.request_id,
+          },
         },
-      },
-      { status: 422 },
-    );
-  }
+        { status: 422 },
+      );
+    }
 
-  const { rate, recipient, schedule, token: rawToken } = body as {
-    rate?: string;
-    recipient?: string;
-    schedule?: string;
-    token?: string;
+    const { rate, recipient, schedule, token: rawToken } = body as {
+      rate?: string;
+      recipient?: string;
+      schedule?: string;
+      token?: string;
+    };
+
+    const rateValue = rate ?? "";
+    const recipientValue = recipient ?? "";
+    const scheduleValue = schedule ?? "";
+    const tokenStr = rawToken?.trim() || "XLM";
+    let normalisedToken: string;
+    try {
+      normalisedToken = normaliseToken(tokenStr);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return createErrorResponse("INVALID_TOKEN", `Invalid token format: ${msg}`, 422);
+    }
+
+    const allowlistResult = await checkTokenAllowed(normalisedToken);
+    if (!allowlistResult.accepted) {
+      logger.warn("Stream creation rejected: token not in allowlist", { token: normalisedToken });
+      return createErrorResponse("TOKEN_NOT_ALLOWED", allowlistResult.reason, 422);
+    }
+
+    const now = new Date().toISOString();
+    let createdStream: Stream | null = null;
+    const MAX_ID_ATTEMPTS = 3;
+
+    for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
+      const id = newStreamId();
+      const candidateStream: Stream = {
+        createdAt: now,
+        id,
+        nextAction: "start",
+        rate: rateValue,
+        recipient: recipientValue,
+        schedule: scheduleValue,
+        status: "draft",
+        updatedAt: now,
+        token: normalisedToken,
+      };
+
+      if (streamRepository.streams.insert(id, candidateStream)) {
+        createdStream = candidateStream;
+        break;
+      }
+    }
+
+    if (!createdStream) {
+      logger.error("Failed to generate unique stream id after max attempts");
+      return createErrorResponse("ID_GENERATION_FAILED", "Failed to generate unique stream identifier", 500);
+    }
+
+    const payload = { data: createdStream, links: { self: `/api/v1/streams/${createdStream.id}` } };
+
+    if (token) {
+      setIdempotency(idempotencyStore, token, fingerprint, 201, payload);
+    }
+
+    return NextResponse.json(payload, { status: 201 });
   };
-
-  const rateValue = rate ?? "";
-  const recipientValue = recipient ?? "";
-  const scheduleValue = schedule ?? "";
-  const tokenStr = rawToken?.trim() || "XLM";
-  let normalisedToken: string;
-  try {
-    normalisedToken = normaliseToken(tokenStr);
-  } catch (err: unknown) {
-    const msg = err instanceof Error ? err.message : String(err);
-    return createErrorResponse("INVALID_TOKEN", `Invalid token format: ${msg}`, 422);
-  }
-
-  const allowlistResult = await checkTokenAllowed(normalisedToken);
-  if (!allowlistResult.accepted) {
-    logger.warn("Stream creation rejected: token not in allowlist", { token: normalisedToken });
-    return createErrorResponse("TOKEN_NOT_ALLOWED", allowlistResult.reason, 422);
-  }
-
-  const id = `stream-${crypto.randomUUID().slice(0, 8)}`;
-  const now = new Date().toISOString();
-  const newStream: Stream = {
-    createdAt: now,
-    id,
-    nextAction: "start",
-    rate: rateValue,
-    recipient: recipientValue,
-    schedule: scheduleValue,
-    status: "draft",
-    updatedAt: now,
-    token: normalisedToken,
-  };
-
-  streamRepository.streams.set(id, newStream);
-  const payload = { data: newStream, links: { self: `/api/v1/streams/${id}` } };
 
   if (token) {
-    setIdempotency(idempotencyStore, token, fingerprint, 201, payload);
+    return withLock(`create:${token}`, executeCreate);
   }
 
-  return NextResponse.json(payload, { status: 201 });
+  return executeCreate();
 }

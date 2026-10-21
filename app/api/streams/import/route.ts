@@ -39,7 +39,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { getStore } from "@/app/lib/db";
+import { getStore, newStreamId } from "@/app/lib/db";
 import { errorResponse, ErrorCode } from "@/app/lib/errors/server";
 import { getCorrelationContext, logger } from "@/app/lib/logger";
 import { validateCreateStreamBody } from "@/app/lib/stream-validation";
@@ -294,7 +294,6 @@ export async function POST(request: Request) {
     if (dryRun) {
       results.push({ row: i + 1, status: "valid" });
     } else {
-      const id = `stream-${crypto.randomUUID().slice(0, 8)}`;
       const now = new Date().toISOString();
       const tokenStr = row.token?.trim() || "XLM";
       let normalisedToken: string;
@@ -304,21 +303,44 @@ export async function POST(request: Request) {
         normalisedToken = "XLM";
       }
 
-      const newStream = {
-        createdAt: now,
-        id,
-        nextAction: "start" as const,
-        rate: row.rate,
-        recipient: row.recipient,
-        schedule: row.schedule,
-        status: "draft" as const,
-        updatedAt: now,
-        token: normalisedToken,
-        memo: row.memo || undefined,
-      };
+      let createdStream = null;
+      const MAX_ID_ATTEMPTS = 3;
 
-      streamRepository.streams.set(id, newStream);
-      results.push({ row: i + 1, status: "imported", streamId: id });
+      for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
+        const id = newStreamId();
+        const candidateStream = {
+          createdAt: now,
+          id,
+          nextAction: "start" as const,
+          rate: row.rate,
+          recipient: row.recipient,
+          schedule: row.schedule,
+          status: "draft" as const,
+          updatedAt: now,
+          token: normalisedToken,
+          memo: row.memo || undefined,
+        };
+
+        if (streamRepository.streams.insert(id, candidateStream)) {
+          createdStream = candidateStream;
+          break;
+        }
+      }
+
+      if (!createdStream) {
+        return NextResponse.json(
+          {
+            error: {
+              code: "ID_GENERATION_FAILED",
+              message: "Failed to generate unique stream identifier",
+              request_id: getCorrelationContext()?.request_id,
+            },
+          },
+          { status: 500 },
+        );
+      }
+
+      results.push({ row: i + 1, status: "imported", streamId: createdStream.id });
     }
   }
 

@@ -5,6 +5,7 @@ import {
   getStore,
   idempotencyToken,
   setIdempotency,
+  newStreamId,
 } from "@/app/lib/db";
 import { errorResponse, ErrorCode } from "@/app/lib/errors/server";
 import { getCorrelationContext, logger } from "@/app/lib/logger";
@@ -249,21 +250,43 @@ export async function POST(request: NextRequest) {
   const createdStreams = [];
 
   for (const input of validItems) {
-    const id = `stream-${crypto.randomUUID().slice(0, 8)}`;
-    const newStream = {
-      createdAt: now,
-      id,
-      nextAction: "start" as const,
-      rate: input.rate,
-      recipient: input.recipient,
-      schedule: input.schedule,
-      status: "draft" as const,
-      updatedAt: now,
-      token: input.token,
-    };
+    let createdStream = null;
+    const MAX_ID_ATTEMPTS = 3;
 
-    streamRepository.streams.set(id, newStream);
-    createdStreams.push(newStream);
+    for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
+      const id = newStreamId();
+      const candidateStream = {
+        createdAt: now,
+        id,
+        nextAction: "start" as const,
+        rate: input.rate,
+        recipient: input.recipient,
+        schedule: input.schedule,
+        status: "draft" as const,
+        updatedAt: now,
+        token: input.token,
+      };
+
+      if (streamRepository.streams.insert(id, candidateStream)) {
+        createdStream = candidateStream;
+        break;
+      }
+    }
+
+    if (!createdStream) {
+      return NextResponse.json(
+        {
+          error: {
+            code: "ID_GENERATION_FAILED",
+            message: "Failed to generate unique stream identifier",
+            request_id: getCorrelationContext()?.request_id,
+          },
+        },
+        { status: 500 },
+      );
+    }
+
+    createdStreams.push(createdStream);
   }
 
   const payload = { data: createdStreams, links: { self: "/api/v1/streams/batch" } };

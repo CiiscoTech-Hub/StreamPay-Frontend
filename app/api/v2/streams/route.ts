@@ -19,7 +19,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { db, encodeCursor, decodeCursor, idempotencyToken, getStore } from "@/app/lib/db";
+import { db, encodeCursor, decodeCursor, idempotencyToken, getStore, newStreamId } from "@/app/lib/db";
 import { getCorrelationContext } from "@/app/lib/logger";
 import { getClientIdentity } from "@/app/lib/rate-limit";
 import { checkOrgDailyQuota, orgQuotaResponse } from "@/app/lib/org-quota";
@@ -120,21 +120,33 @@ export async function POST(request: Request) {
   }
 
   // ── 4. Persist and respond ────────────────────────────────────────────────
-  const id = `stream-${crypto.randomUUID().slice(0, 8)}`;
   const now = new Date().toISOString();
-  const newStream: Stream = {
-    id,
-    recipient: String(recipient),
-    rate: String(rate),
-    schedule: String(schedule),
-    status: "draft",
-    nextAction: "start",
-    createdAt: now,
-    updatedAt: now,
-    token: "XLM",
-  };
+  let newStream: Stream | null = null;
+  const MAX_ID_ATTEMPTS = 3;
 
-  db.streams.set(id, newStream);
+  for (let attempt = 0; attempt < MAX_ID_ATTEMPTS; attempt++) {
+    const id = newStreamId();
+    const candidateStream: Stream = {
+      id,
+      recipient: String(recipient),
+      rate: String(rate),
+      schedule: String(schedule),
+      status: "draft",
+      nextAction: "start",
+      createdAt: now,
+      updatedAt: now,
+      token: "XLM",
+    };
+
+    if (db.streams.insert(id, candidateStream)) {
+      newStream = candidateStream;
+      break;
+    }
+  }
+
+  if (!newStream) {
+    return errorResponse("ID_GENERATION_FAILED", "Failed to generate unique stream identifier", 500);
+  }
 
   const stream = toV2Stream(dbStreamToV1(newStream));
   const payload = stream;
